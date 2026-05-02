@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use parking_lot::RwLock;
-// use serde_json::json;
 use serde_json::Value;
 
 /// A structural-sharing JSON value.
@@ -83,13 +83,15 @@ impl SharedValue {
     }
 }
 
-/// The internal generational logic
+/// The Store
+#[derive(Clone, Debug)]
 pub struct Store {
     history: VecDeque<(usize, Arc<SharedValue>)>,
     next_gen: usize,
 }
 
 impl Store {
+    /// Create a store from an initial JSON Value.
     pub fn new(initial_json: Value) -> Self {
         let initial_shared = Arc::new(initial_json.into());
         let mut history = VecDeque::new();
@@ -103,36 +105,25 @@ impl Store {
 
     /// Apply a patch. Performs COW update, periodic rebase, and automatic GC.
     pub fn update(&mut self, patch: Value) {
-        // Clone latest value (in a block to ensure latest_arc is dropped before GC)
-        let mut new_val = {
-            // 1. Get latest, clone the Arc to start COW process
-            let latest_arc = self.history.back().unwrap().1.clone();
-            (*latest_arc).clone()
+        // Use a block to ensure latest_arc is dropped BEFORE gc
+        let (latest_gen, mut new_val) = {
+            let (latest_gen, latest_arc) = self.latest_with_gen();
+
+            (latest_gen, (*latest_arc).clone())
         };
 
         // Apply patch (efficient structural update)
         new_val.apply_merge_patch(patch);
 
-        // Periodic Rebase (Defragmentation for read performance)
-        let final_value = if self.next_gen.is_multiple_of(20) {
+        let next_gen = latest_gen + 1;
+        let final_value = if next_gen.is_multiple_of(20) {
             Arc::new(new_val.deep_clone())
         } else {
             Arc::new(new_val)
         };
 
-        let next = self.next_gen;
-        self.history.push_back((next, final_value));
-        self.next_gen += 1;
-
-        // Automatic GC: Drop old versions if no clients are using them
-        while self.history.len() > 1 {
-            // Check if only the history deque holds this Arc
-            if Arc::strong_count(&self.history[0].1) == 1 {
-                self.history.pop_front();
-            } else {
-                break; // A client is still holding this version
-            }
-        }
+        self.commit(next_gen, final_value);
+        self.gc();
     }
 
     /// Retrieve a specific generation. Returns Arc for O(1) handover.
@@ -142,29 +133,174 @@ impl Store {
             .find(|(id, _)| *id == generation)
             .map(|(_, v)| Arc::clone(v))
     }
+
+    /// Retrieve latest generation. Returns Arc for O(1) handover.
+    pub fn latest(&self) -> Option<Arc<SharedValue>> {
+        self.history.back().map(|(_, v)| Arc::clone(v))
+    }
+
+    /// Retrieve oldest generation. Returns Arc for O(1) handover.
+    pub fn oldest(&self) -> Option<Arc<SharedValue>> {
+        self.history.front().map(|(_, v)| Arc::clone(v))
+    }
+
+    /// Internal helper for SharedStore staged updates.
+    fn latest_with_gen(&self) -> (usize, Arc<SharedValue>) {
+        let (generation, val) = self.history.back().unwrap();
+        (*generation, Arc::clone(val))
+    }
+
+    /// Internal helper for SharedStore staged updates.
+    fn commit(&mut self, generation: usize, value: Arc<SharedValue>) {
+        self.history.push_back((generation, value));
+        self.next_gen = generation + 1;
+    }
+
+    /// Internal helper for SharedStore staged updates.
+    fn gc(&mut self) {
+        while self.history.len() > 1 {
+            if Arc::strong_count(&self.history[0].1) == 1 {
+                self.history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[cfg(feature = "bench-utils")]
+    pub fn count_unique_nodes(&self) -> usize {
+        use std::collections::HashSet;
+        let mut seen_objects = HashSet::new();
+        let mut seen_arrays = HashSet::new();
+        let mut total_nodes = 0;
+
+        for (_, sv) in &self.history {
+            Self::count_unique_nodes_recursive(
+                sv,
+                &mut seen_objects,
+                &mut seen_arrays,
+                &mut total_nodes,
+            );
+        }
+        total_nodes
+    }
+
+    #[cfg(feature = "bench-utils")]
+    fn count_unique_nodes_recursive(
+        sv: &SharedValue,
+        seen_objects: &mut std::collections::HashSet<*const BTreeMap<String, SharedValue>>,
+        seen_arrays: &mut std::collections::HashSet<*const Vec<SharedValue>>,
+        total_nodes: &mut usize,
+    ) {
+        match sv {
+            SharedValue::Leaf(_) => {
+                *total_nodes += 1;
+            }
+            SharedValue::Object(m) => {
+                let ptr = Arc::as_ptr(m);
+                if seen_objects.insert(ptr) {
+                    *total_nodes += 1;
+                    for v in m.values() {
+                        Self::count_unique_nodes_recursive(
+                            v,
+                            seen_objects,
+                            seen_arrays,
+                            total_nodes,
+                        );
+                    }
+                }
+            }
+            SharedValue::Array(a) => {
+                let ptr = Arc::as_ptr(a);
+                if seen_arrays.insert(ptr) {
+                    *total_nodes += 1;
+                    for v in a.iter() {
+                        Self::count_unique_nodes_recursive(
+                            v,
+                            seen_objects,
+                            seen_arrays,
+                            total_nodes,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The Thread-Safe Store
 pub struct SharedStore {
-    inner: Arc<RwLock<Store>>,
+    inner: Arc<SharedStoreInner>,
+}
+
+struct SharedStoreInner {
+    store: RwLock<Store>,
+    /// Serializes updates to ensure only one thread is calculating the next generation
+    /// while still allowing concurrent readers.
+    update_lock: Mutex<()>,
 }
 
 impl SharedStore {
+    /// Create a store from an initial JSON Value.
     pub fn new(initial_json: Value) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Store::new(initial_json))),
+            inner: Arc::new(SharedStoreInner {
+                store: RwLock::new(Store::new(initial_json)),
+                update_lock: Mutex::new(()),
+            }),
         }
     }
 
-    /// Apply a patch. Performs COW update, periodic rebase, and automatic GC.
+    /// Apply a patch. Performs COW update and periodic rebase outside the write lock.
+    /// Serialization is handled by a Mutex, but the RwLock is only held for a brief moment to commit.
     pub fn update(&self, patch: Value) {
-        let mut store = self.inner.write();
-        store.update(patch)
+        // Serialize writers to ensure we don't have multiple threads trying to calculate Gen N
+        let _guard = self.inner.update_lock.lock();
+
+        // Get the baseline under a READ lock (very brief)
+        // Use a block to ensure latest_arc is dropped BEFORE gc
+        let (latest_gen, mut new_val) = {
+            let (latest_gen, latest_arc) = {
+                let store = self.inner.store.read();
+                store.latest_with_gen()
+            };
+
+            (latest_gen, (*latest_arc).clone())
+        };
+
+        // Do most of our modification work without locking the store
+        new_val.apply_merge_patch(patch);
+
+        let next_gen = latest_gen + 1;
+        let final_value = if next_gen.is_multiple_of(20) {
+            Arc::new(new_val.deep_clone())
+        } else {
+            Arc::new(new_val)
+        };
+
+        // Finally, commit the result under a WRITE lock
+        {
+            let mut store = self.inner.store.write();
+            store.commit(next_gen, final_value);
+            store.gc();
+        }
     }
 
     /// Retrieve a specific generation. Returns Arc for O(1) handover.
     pub fn get(&self, generation: usize) -> Option<Arc<SharedValue>> {
-        let store = self.inner.read();
+        let store = self.inner.store.read();
         store.get(generation)
+    }
+
+    /// Retrieve latest generation. Returns Arc for O(1) handover.
+    pub fn latest(&self) -> Option<Arc<SharedValue>> {
+        let store = self.inner.store.read();
+        store.latest()
+    }
+
+    /// Retrieve oldest generation. Returns Arc for O(1) handover.
+    pub fn oldest(&self) -> Option<Arc<SharedValue>> {
+        let store = self.inner.store.read();
+        store.oldest()
     }
 }
