@@ -1,6 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use gjstore::gjstore::Store;
+use gjstore::gjstore::{SharedStore, Store};
 use json_patch::merge;
+use parking_lot::{Mutex, RwLock};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde_json::{Map, Value, json};
@@ -31,7 +32,10 @@ impl NaiveStore {
         merge(&mut new_val, &patch);
         self.history.push_back((self.next_gen, Arc::new(new_val)));
         self.next_gen += 1;
+        self.gc();
+    }
 
+    pub fn gc(&mut self) {
         while self.history.len() > self.history_limit {
             if Arc::strong_count(&self.history[0].1) == 1 {
                 self.history.pop_front();
@@ -47,6 +51,52 @@ impl NaiveStore {
 
     pub fn count_total_nodes(&self) -> usize {
         self.history.iter().map(|(_, v)| count_nodes_value(v)).sum()
+    }
+}
+
+/// SharedNaiveStore: Thread-safe version of NaiveStore.
+pub struct SharedNaiveStore {
+    inner: Arc<SharedNaiveStoreInner>,
+}
+
+struct SharedNaiveStoreInner {
+    store: RwLock<NaiveStore>,
+    update_lock: Mutex<()>,
+}
+
+impl SharedNaiveStore {
+    pub fn new(initial_json: Value, history_limit: usize) -> Self {
+        Self {
+            inner: Arc::new(SharedNaiveStoreInner {
+                store: RwLock::new(NaiveStore::new(initial_json, history_limit)),
+                update_lock: Mutex::new(()),
+            }),
+        }
+    }
+
+    pub fn update(&self, patch: Value) {
+        let _guard = self.inner.update_lock.lock();
+
+        let latest_val = {
+            let store = self.inner.store.read();
+            store.latest().unwrap()
+        };
+
+        let mut new_val = (*latest_val).clone(); // Full deep clone
+        merge(&mut new_val, &patch);
+
+        {
+            let mut store = self.inner.store.write();
+            let next_gen = store.next_gen;
+            store.history.push_back((next_gen, Arc::new(new_val)));
+            store.next_gen += 1;
+            store.gc();
+        }
+    }
+
+    pub fn latest(&self) -> Option<Arc<Value>> {
+        let store = self.inner.store.read();
+        store.latest()
     }
 }
 
@@ -105,8 +155,8 @@ fn generate_patch_pool(rng: &mut ChaCha8Rng, paths: &[PathInfo], pool_size: usiz
 
                 let val = match info.json_type {
                     JsonType::Leaf => match rng.gen_range(0..3) {
-                        0 => Value::Number(rng.gen_range(0..1000).into()),
-                        1 => Value::String(format!("patch_v_{}", rng.gen_range(0..1000))),
+                        0 => Value::Number(rng.gen_range(0..1_000).into()),
+                        1 => Value::String(format!("patch_v_{}", rng.gen_range(0..1_000))),
                         _ => Value::Bool(rng.r#gen()),
                     },
                     JsonType::Object => {
@@ -189,8 +239,8 @@ fn generate_random_json_recursive(
         }
     } else {
         match rng.gen_range(0..3) {
-            0 => Value::Number(rng.gen_range(0..1000).into()),
-            1 => Value::String(format!("v_{}", rng.gen_range(0..1000))),
+            0 => Value::Number(rng.gen_range(0..1_000).into()),
+            1 => Value::String(format!("v_{}", rng.gen_range(0..1_000))),
             _ => Value::Bool(rng.r#gen()),
         }
     }
@@ -245,14 +295,14 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let mut paths = Vec::new();
     collect_typed_paths(&corpus, Vec::new(), &mut paths);
 
-    let patch_pool = generate_patch_pool(&mut rng, &paths, 1000);
+    let patch_pool = generate_patch_pool(&mut rng, &paths, 1_000);
 
     let history_limit = 10;
 
     // Report memory usage once for a fixed scenario
     report_memory(&corpus, &patch_pool, history_limit, 50);
 
-    let ratios = [100, 1000, 10000];
+    let ratios = [100, 1_000, 10_000];
 
     for read_ratio in ratios {
         let group_name = format!("Mixed Workload (1 Write : {} Reads)", read_ratio);
@@ -264,7 +314,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             let mut idx = 0;
             b.iter(|| {
                 // 1 Write
-                store.update(patch_pool[idx % 1000].clone());
+                store.update(patch_pool[idx % 1_000].clone());
                 idx += 1;
 
                 // N Reads
@@ -283,7 +333,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             let mut idx = 0;
             b.iter(|| {
                 // 1 Write
-                store.update(patch_pool[idx % 1000].clone());
+                store.update(patch_pool[idx % 1_000].clone());
                 idx += 1;
 
                 // N Reads
@@ -297,5 +347,72 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, criterion_benchmark);
+pub fn concurrent_benchmark(c: &mut Criterion) {
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+    let corpus = generate_random_json(&mut rng, 10_000);
+    let mut paths = Vec::new();
+    collect_typed_paths(&corpus, Vec::new(), &mut paths);
+    let patch_pool = generate_patch_pool(&mut rng, &paths, 1_000);
+    let history_limit = 10;
+
+    let ratios = [100, 1_000, 10_000];
+
+    for read_ratio in ratios {
+        let group_name = format!(
+            "Concurrent Workload (1 Writer : 4 Readers, 1:{} ratio)",
+            read_ratio
+        );
+        let mut group = c.benchmark_group(group_name);
+
+        group.bench_function("SharedStore", |b| {
+            let store = SharedStore::new(corpus.clone());
+            b.iter(|| {
+                std::thread::scope(|s| {
+                    // Writer thread doing 10 writes
+                    s.spawn(|| {
+                        for i in 0..10 {
+                            store.update(patch_pool[i % 1_000].clone());
+                        }
+                    });
+
+                    // 4 Reader threads doing proportional reads
+                    for _ in 0..4 {
+                        s.spawn(|| {
+                            for _ in 0..(10 * read_ratio / 4) {
+                                let _v = store.latest().unwrap();
+                            }
+                        });
+                    }
+                });
+            });
+        });
+
+        group.bench_function("SharedNaive", |b| {
+            let store = SharedNaiveStore::new(corpus.clone(), history_limit);
+            b.iter(|| {
+                std::thread::scope(|s| {
+                    // Writer thread doing 10 writes
+                    s.spawn(|| {
+                        for i in 0..10 {
+                            store.update(patch_pool[i % 1_000].clone());
+                        }
+                    });
+
+                    // 4 Reader threads doing proportional reads
+                    for _ in 0..4 {
+                        s.spawn(|| {
+                            for _ in 0..(10 * read_ratio / 4) {
+                                let _v = store.latest().unwrap();
+                            }
+                        });
+                    }
+                });
+            });
+        });
+        group.finish();
+    }
+}
+
+criterion_group!(benches, criterion_benchmark, concurrent_benchmark);
 criterion_main!(benches);
