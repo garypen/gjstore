@@ -2,7 +2,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use gjstore::gjstore::{SharedStore, Store};
 use json_patch::merge;
 use parking_lot::{Mutex, RwLock};
-use rand::{Rng, SeedableRng};
+use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use serde_json::{Map, Value, json};
 use std::collections::VecDeque;
@@ -151,24 +151,24 @@ fn generate_patch_pool(rng: &mut ChaCha8Rng, paths: &[PathInfo], pool_size: usiz
                 if paths.is_empty() {
                     break;
                 }
-                let info = &paths[rng.gen_range(0..paths.len())];
+                let info = &paths[rng.random_range(0..paths.len())];
 
                 let val = match info.json_type {
-                    JsonType::Leaf => match rng.gen_range(0..3) {
-                        0 => Value::Number(rng.gen_range(0..1_000).into()),
-                        1 => Value::String(format!("patch_v_{}", rng.gen_range(0..1_000))),
-                        _ => Value::Bool(rng.r#gen()),
+                    JsonType::Leaf => match rng.random_range(0..3) {
+                        0 => Value::Number(rng.random_range(0..1_000).into()),
+                        1 => Value::String(format!("patch_v_{}", rng.random_range(0..1_000))),
+                        _ => Value::Bool(rng.random()),
                     },
                     JsonType::Object => {
                         // Generate a small replacement/merge object (2-4 nodes)
-                        let mut remaining = rng.gen_range(2..5);
+                        let mut remaining = rng.random_range(2..5);
                         generate_random_json_recursive(rng, 0, &mut remaining, true)
                     }
                     JsonType::Array => {
                         // Generate a small replacement array
                         let mut arr = Vec::new();
-                        for _ in 0..rng.gen_range(2..5) {
-                            arr.push(json!(rng.gen_range(0..100)));
+                        for _ in 0..rng.random_range(2..5) {
+                            arr.push(json!(rng.random_range(0..100)));
                         }
                         Value::Array(arr)
                     }
@@ -207,10 +207,10 @@ fn generate_random_json_recursive(
         _ => 0.05,
     };
 
-    if (force_object || rng.gen_bool(p_container)) && *remaining > 0 {
-        if force_object || rng.gen_bool(0.7) {
+    if (force_object || rng.random_bool(p_container)) && *remaining > 0 {
+        if force_object || rng.random_bool(0.7) {
             let mut map = Map::new();
-            let children = rng.gen_range(2..6);
+            let children = rng.random_range(2..6);
             for i in 0..children {
                 if *remaining == 0 {
                     break;
@@ -223,7 +223,7 @@ fn generate_random_json_recursive(
             Value::Object(map)
         } else {
             let mut arr = Vec::new();
-            let children = rng.gen_range(2..6);
+            let children = rng.random_range(2..6);
             for _ in 0..children {
                 if *remaining == 0 {
                     break;
@@ -238,10 +238,10 @@ fn generate_random_json_recursive(
             Value::Array(arr)
         }
     } else {
-        match rng.gen_range(0..3) {
-            0 => Value::Number(rng.gen_range(0..1_000).into()),
-            1 => Value::String(format!("v_{}", rng.gen_range(0..1_000))),
-            _ => Value::Bool(rng.r#gen()),
+        match rng.random_range(0..3) {
+            0 => Value::Number(rng.random_range(0..1_000).into()),
+            1 => Value::String(format!("v_{}", rng.random_range(0..1_000))),
+            _ => Value::Bool(rng.random()),
         }
     }
 }
