@@ -256,7 +256,7 @@ fn report_memory(corpus: &Value, patch_pool: &[Value], history_limit: usize, ite
         "\n--- Memory Usage Report (History Limit: {}) ---",
         history_limit
     );
-    let mut store = Store::new(corpus.clone());
+    let mut store = Store::builder().value(corpus.clone()).build();
     let mut naive = NaiveStore::new(corpus.clone(), history_limit);
 
     println!("Before updates:");
@@ -309,7 +309,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let mut group = c.benchmark_group(group_name);
 
         group.bench_function("Store", |b| {
-            let mut store = Store::new(corpus.clone());
+            let mut store = Store::builder().value(corpus.clone()).build();
             let mut garbage = store.oldest();
             let mut idx = 0;
             b.iter(|| {
@@ -366,7 +366,7 @@ pub fn concurrent_benchmark(c: &mut Criterion) {
         let mut group = c.benchmark_group(group_name);
 
         group.bench_function("SharedStore", |b| {
-            let store = SharedStore::new(corpus.clone());
+            let store = SharedStore::builder().value(corpus.clone()).build();
             b.iter(|| {
                 std::thread::scope(|s| {
                     // Writer thread doing 10 writes

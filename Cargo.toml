@@ -15,6 +15,7 @@ categories = ["data structures"]
 description = "generational, garbage collected, json store"
 
 [dependencies]
+bon = "3.9.1"
 parking_lot = "0.12.5"
 serde_json = "1.0.149"
 

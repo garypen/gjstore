@@ -29,7 +29,10 @@ fn main() {
         "features": ["generational", "sharing"]
     });
 
-    let mut store = Store::new(initial);
+    let mut store = Store::builder()
+        .value(initial)
+        .interval(20) // optional, defaults to 20
+        .build();
 
     // Keep a reference to the oldest generation so that it is preserved
     // past the update. If we didn't take the reference here, then the
@@ -61,7 +64,9 @@ use std::sync::Arc;
 use std::thread;
 
 fn main() {
-    let store = Arc::new(SharedStore::new(json!({"count": 0})));
+    let store = Arc::new(SharedStore::builder()
+        .value(json!({"count": 0}))
+        .build());
 
     let mut handles = vec![];
     for i in 0..10 {
@@ -84,7 +89,7 @@ fn main() {
 1. SharedValue: JSON values are converted into a `SharedValue` tree where objects and arrays are wrapped in `Arc`.
 2. Merge Patch: When a patch is applied, only the modified branches of the tree are cloned. Untouched branches are shared between the new and old generations.
 3. Garbage Collection: The store keeps a history of generations. When the oldest generation's `Arc` count drops to 1 (meaning it is only referenced by the store's history), it is eligible for removal.
-4. Rebase: Every 20 generations, the store performs a deep clone of the latest value to consolidate memory and break references to old structural fragments.
+4. Rebase: Every `interval` generations (defaulting to 20), the store performs a deep clone of the latest value to consolidate memory and break references to old structural fragments.
 
 ## License
 

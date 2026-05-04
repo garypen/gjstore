@@ -15,7 +15,7 @@ fn shared_to_json(sv: &SharedValue) -> Value {
 #[test]
 fn test_initialization() {
     let initial = json!({"a": 1, "b": [1, 2, 3]});
-    let store = SharedStore::new(initial.clone());
+    let store = SharedStore::builder().value(initial.clone()).build();
     
     let gen0 = store.get(0).expect("Generation 0 should exist");
     assert_eq!(shared_to_json(&gen0), initial);
@@ -23,7 +23,7 @@ fn test_initialization() {
 
 #[test]
 fn test_basic_update() {
-    let store = SharedStore::new(json!({"a": 1, "b": 2}));
+    let store = SharedStore::builder().value(json!({"a": 1, "b": 2})).build();
     store.update(json!({"a": 3}));
     
     let gen1 = store.get(1).expect("Generation 1 should exist");
@@ -32,7 +32,7 @@ fn test_basic_update() {
 
 #[test]
 fn test_null_patch_removes_key() {
-    let store = SharedStore::new(json!({"a": 1, "b": 2}));
+    let store = SharedStore::builder().value(json!({"a": 1, "b": 2})).build();
     store.update(json!({"a": null}));
     
     let gen1 = store.get(1).expect("Generation 1 should exist");
@@ -41,7 +41,7 @@ fn test_null_patch_removes_key() {
 
 #[test]
 fn test_nested_update() {
-    let store = SharedStore::new(json!({"a": {"x": 1, "y": 2}}));
+    let store = SharedStore::builder().value(json!({"a": {"x": 1, "y": 2}})).build();
     store.update(json!({"a": {"x": 3}}));
     
     let gen1 = store.get(1).expect("Generation 1 should exist");
@@ -51,7 +51,7 @@ fn test_nested_update() {
 #[test]
 fn test_structural_sharing() {
     let initial = json!({"a": {"x": 1}, "b": {"y": 2}});
-    let store = SharedStore::new(initial);
+    let store = SharedStore::builder().value(initial).build();
     
     let gen0 = store.get(0).unwrap();
     store.update(json!({"a": {"x": 3}}));
@@ -83,7 +83,7 @@ fn test_structural_sharing() {
 
 #[test]
 fn test_gc_behavior() {
-    let store = SharedStore::new(json!({"count": 0}));
+    let store = SharedStore::builder().value(json!({"count": 0})).build();
     
     store.update(json!({"count": 1})); // gen 0 should be dropped
     assert!(store.get(0).is_none(), "Generation 0 should have been GC'd");
@@ -109,7 +109,7 @@ fn test_gc_behavior() {
 
 #[test]
 fn test_deep_clone_rebase() {
-    let store = SharedStore::new(json!({"obj": {"x": 1}, "other": 0}));
+    let store = SharedStore::builder().value(json!({"obj": {"x": 1}, "other": 0})).build();
     let _gen0 = store.get(0).unwrap(); // Hold gen 0 to keep history
     
     for i in 1..20 {
@@ -135,7 +135,7 @@ fn test_deep_clone_rebase() {
 
 #[test]
 fn test_patch_array_replaces() {
-    let store = SharedStore::new(json!({"a": [1, 2]}));
+    let store = SharedStore::builder().value(json!({"a": [1, 2]})).build();
     store.update(json!({"a": [3, 4]})); // RFC 7396: arrays are replaced, not merged
     
     let gen1 = store.get(1).unwrap();

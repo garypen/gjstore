@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 
 fn main() {
-    let store = Arc::new(SharedStore::new(json!({"count": 0})));
+    let store = Arc::new(SharedStore::builder().value(json!({"count": 0})).build());
 
     let mut handles = vec![];
     for i in 0..10 {

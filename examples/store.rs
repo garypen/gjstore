@@ -7,7 +7,7 @@ fn main() {
         "features": ["generational", "sharing"]
     });
 
-    let mut store = Store::new(initial);
+    let mut store = Store::builder().value(initial).build();
 
     // Keep a reference to the oldest generation so that it is preserved
     // past the update. If we didn't take the reference here, then the

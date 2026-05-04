@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use bon::bon;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use serde_json::Value;
@@ -88,18 +89,25 @@ impl SharedValue {
 pub struct Store {
     history: VecDeque<(usize, Arc<SharedValue>)>,
     next_gen: usize,
+    interval: usize,
 }
 
+#[bon]
 impl Store {
-    /// Create a store from an initial JSON Value.
-    pub fn new(initial_json: Value) -> Self {
-        let initial_shared = Arc::new(initial_json.into());
+    /// Create a store with optional initial JSON Value and rebase interval.
+    #[builder]
+    pub fn new(
+        #[builder(default = Value::Object(Default::default()))] value: Value,
+        #[builder(default = 20)] interval: usize,
+    ) -> Self {
+        let initial_shared = Arc::new(value.into());
         let mut history = VecDeque::new();
         history.push_back((0, initial_shared));
 
         Self {
             history,
             next_gen: 1,
+            interval,
         }
     }
 
@@ -116,7 +124,7 @@ impl Store {
         new_val.apply_merge_patch(patch);
 
         let next_gen = latest_gen + 1;
-        let final_value = if next_gen.is_multiple_of(20) {
+        let final_value = if next_gen.is_multiple_of(self.interval) {
             Arc::new(new_val.deep_clone())
         } else {
             Arc::new(new_val)
@@ -240,12 +248,17 @@ struct SharedStoreInner {
     update_lock: Mutex<()>,
 }
 
+#[bon]
 impl SharedStore {
-    /// Create a store from an initial JSON Value.
-    pub fn new(initial_json: Value) -> Self {
+    /// Create a store with optional initial JSON Value and rebase interval.
+    #[builder]
+    pub fn new(
+        #[builder(default = Value::Object(Default::default()))] value: Value,
+        #[builder(default = 20)] interval: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(SharedStoreInner {
-                store: RwLock::new(Store::new(initial_json)),
+                store: RwLock::new(Store::builder().value(value).interval(interval).build()),
                 update_lock: Mutex::new(()),
             }),
         }
@@ -259,20 +272,21 @@ impl SharedStore {
 
         // Get the baseline under a READ lock (very brief)
         // Use a block to ensure latest_arc is dropped BEFORE gc
-        let (latest_gen, mut new_val) = {
-            let (latest_gen, latest_arc) = {
+        let (latest_gen, interval, mut new_val) = {
+            let (latest_gen, interval, latest_arc) = {
                 let store = self.inner.store.read();
-                store.latest_with_gen()
+                let (generation, val) = store.latest_with_gen();
+                (generation, store.interval, val)
             };
 
-            (latest_gen, (*latest_arc).clone())
+            (latest_gen, interval, (*latest_arc).clone())
         };
 
         // Do most of our modification work without locking the store
         new_val.apply_merge_patch(patch);
 
         let next_gen = latest_gen + 1;
-        let final_value = if next_gen.is_multiple_of(20) {
+        let final_value = if next_gen.is_multiple_of(interval) {
             Arc::new(new_val.deep_clone())
         } else {
             Arc::new(new_val)
