@@ -31,6 +31,11 @@ fn main() {
 
     let mut store = Store::new(initial);
 
+    // Keep a reference to the oldest generation so that it is preserved
+    // past the update. If we didn't take the reference here, then the
+    // gc triggered by an update would remove that generation.
+    let oldest = store.oldest().unwrap();
+
     // Apply a merge patch
     store.update(json!({
         "features": ["generational", "sharing", "patching"],
@@ -41,7 +46,6 @@ fn main() {
     let latest = store.latest().unwrap();
     println!("Latest: {:?}", latest);
 
-    let oldest = store.oldest().unwrap();
     println!("Oldest: {:?}", oldest);
 }
 ```
