@@ -1,7 +1,18 @@
 [package]
 name = "gjstore"
 version = "0.1.0"
+authors = [
+  "garypen <garypen@gmail.com>",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/garypen/gjstore"
+homepage = "https://github.com/garypen/gjstore"
+documentation = "https://github.com/garypen/gjstore?tab=readme-ov-file"
 edition = "2024"
+readme = "README.md"
+keywords = ["store", "json"]
+categories = ["data structures"]
+description = "generational, garbage collected, json store"
 
 [dependencies]
 parking_lot = "0.12.5"
