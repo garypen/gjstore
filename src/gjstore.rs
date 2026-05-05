@@ -36,6 +36,18 @@ impl From<Value> for SharedValue {
     }
 }
 
+impl From<SharedValue> for Value {
+    fn from(shared: SharedValue) -> Self {
+        match shared {
+            SharedValue::Leaf(v) => v,
+            SharedValue::Array(a) => Value::Array(a.iter().cloned().map(Value::from).collect()),
+            SharedValue::Object(m) => {
+                Value::Object(m.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect())
+            }
+        }
+    }
+}
+
 impl SharedValue {
     /// Recursively clones every node to ensure memory locality and
     /// disconnect from previous generations. Use in re-basing.
