@@ -3,9 +3,19 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bon::bon;
+use json_patch::Patch;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use serde_json::Value;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("JSON Patch error: {0}")]
+    PatchError(String),
+    #[error("Invalid patch format: expected Object (Merge Patch) or Array (JSON Patch)")]
+    InvalidPatchFormat,
+}
 
 /// A structural-sharing JSON value.
 /// Containers (Objects/Arrays) are wrapped in Arc to allow different generations
@@ -41,9 +51,11 @@ impl From<SharedValue> for Value {
         match shared {
             SharedValue::Leaf(v) => v,
             SharedValue::Array(a) => Value::Array(a.iter().cloned().map(Value::from).collect()),
-            SharedValue::Object(m) => {
-                Value::Object(m.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect())
-            }
+            SharedValue::Object(m) => Value::Object(
+                m.iter()
+                    .map(|(k, v)| (k.clone(), Value::from(v.clone())))
+                    .collect(),
+            ),
         }
     }
 }
@@ -94,6 +106,241 @@ impl SharedValue {
             }
         }
     }
+
+    /// RFC 6902 JSON Patch implementation with structural sharing.
+    fn apply_json_patch(&mut self, patch: Patch) -> Result<(), StoreError> {
+        for op in patch.0 {
+            self.apply_operation(op)?;
+        }
+        Ok(())
+    }
+
+    fn apply_operation(&mut self, op: json_patch::PatchOperation) -> Result<(), StoreError> {
+        match op {
+            json_patch::PatchOperation::Add(add) => {
+                let val = SharedValue::from(add.value);
+                self.add_at(add.path.as_str(), val)?;
+            }
+            json_patch::PatchOperation::Remove(rem) => {
+                self.remove_at(rem.path.as_str())?;
+            }
+            json_patch::PatchOperation::Replace(rep) => {
+                let val = SharedValue::from(rep.value);
+                let target = self.get_mut(rep.path.as_str())?;
+                *target = val;
+            }
+            json_patch::PatchOperation::Move(mov) => {
+                let val = self.remove_at(mov.from.as_str())?;
+                self.add_at(mov.path.as_str(), val)?;
+            }
+            json_patch::PatchOperation::Copy(cop) => {
+                let val = self.get_at(cop.from.as_str())?.clone();
+                self.add_at(cop.path.as_str(), val)?;
+            }
+            json_patch::PatchOperation::Test(test) => {
+                let expected = SharedValue::from(test.value);
+                let actual = self.get_at(test.path.as_str())?;
+                if !Self::equals(actual, &expected) {
+                    return Err(StoreError::PatchError(format!(
+                        "Test failed at path: {}",
+                        test.path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn equals(a: &SharedValue, b: &SharedValue) -> bool {
+        match (a, b) {
+            (SharedValue::Leaf(v1), SharedValue::Leaf(v2)) => v1 == v2,
+            (SharedValue::Array(a1), SharedValue::Array(a2)) => {
+                if Arc::ptr_eq(a1, a2) {
+                    return true;
+                }
+                if a1.len() != a2.len() {
+                    return false;
+                }
+                a1.iter().zip(a2.iter()).all(|(x, y)| Self::equals(x, y))
+            }
+            (SharedValue::Object(o1), SharedValue::Object(o2)) => {
+                if Arc::ptr_eq(o1, o2) {
+                    return true;
+                }
+                if o1.len() != o2.len() {
+                    return false;
+                }
+                o1.iter()
+                    .zip(o2.iter())
+                    .all(|((k1, v1), (k2, v2))| k1 == k2 && Self::equals(v1, v2))
+            }
+            _ => false,
+        }
+    }
+
+    fn get_at(&self, path: &str) -> Result<&SharedValue, StoreError> {
+        let mut current = self;
+        for segment in parse_segments(path) {
+            match current {
+                SharedValue::Object(m) => {
+                    current = m.get(&segment).ok_or_else(|| {
+                        StoreError::PatchError(format!("Path not found: {} (at {})", path, segment))
+                    })?;
+                }
+                SharedValue::Array(a) => {
+                    let idx = parse_index(&segment, a.len(), false)?;
+                    current = a.get(idx).ok_or_else(|| {
+                        StoreError::PatchError(format!(
+                            "Index out of bounds: {} (at {})",
+                            path, segment
+                        ))
+                    })?;
+                }
+                SharedValue::Leaf(_) => {
+                    return Err(StoreError::PatchError(format!(
+                        "Cannot navigate into leaf at {}",
+                        segment
+                    )));
+                }
+            }
+        }
+        Ok(current)
+    }
+
+    fn get_mut(&mut self, path: &str) -> Result<&mut SharedValue, StoreError> {
+        let mut current = self;
+        for segment in parse_segments(path) {
+            match current {
+                SharedValue::Object(arc) => {
+                    let map = Arc::make_mut(arc);
+                    current = map.get_mut(&segment).ok_or_else(|| {
+                        StoreError::PatchError(format!("Path not found: {} (at {})", path, segment))
+                    })?;
+                }
+                SharedValue::Array(arc) => {
+                    let vec = Arc::make_mut(arc);
+                    let idx = parse_index(&segment, vec.len(), false)?;
+                    current = vec.get_mut(idx).ok_or_else(|| {
+                        StoreError::PatchError(format!(
+                            "Index out of bounds: {} (at {})",
+                            path, segment
+                        ))
+                    })?;
+                }
+                SharedValue::Leaf(_) => {
+                    return Err(StoreError::PatchError(format!(
+                        "Cannot navigate into leaf at {}",
+                        segment
+                    )));
+                }
+            }
+        }
+        Ok(current)
+    }
+
+    fn add_at(&mut self, path: &str, value: SharedValue) -> Result<(), StoreError> {
+        if path.is_empty() {
+            *self = value;
+            return Ok(());
+        }
+
+        let (parent_path, last_segment) = split_path(path);
+        let parent = self.get_mut(parent_path)?;
+
+        match parent {
+            SharedValue::Object(arc) => {
+                let map = Arc::make_mut(arc);
+                map.insert(last_segment.to_string(), value);
+            }
+            SharedValue::Array(arc) => {
+                let vec = Arc::make_mut(arc);
+                let idx = parse_index(last_segment, vec.len(), true)?;
+                if idx >= vec.len() {
+                    vec.push(value);
+                } else {
+                    vec.insert(idx, value);
+                }
+            }
+            SharedValue::Leaf(_) => {
+                return Err(StoreError::PatchError(format!(
+                    "Cannot add to leaf at {}",
+                    parent_path
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_at(&mut self, path: &str) -> Result<SharedValue, StoreError> {
+        if path.is_empty() {
+            return Err(StoreError::PatchError("Cannot remove root".into()));
+        }
+
+        let (parent_path, last_segment) = split_path(path);
+        let parent = self.get_mut(parent_path)?;
+
+        match parent {
+            SharedValue::Object(arc) => {
+                let map = Arc::make_mut(arc);
+                map.remove(last_segment).ok_or_else(|| {
+                    StoreError::PatchError(format!("Key not found: {}", last_segment))
+                })
+            }
+            SharedValue::Array(arc) => {
+                let vec = Arc::make_mut(arc);
+                let idx = parse_index(last_segment, vec.len(), false)?;
+                if idx >= vec.len() {
+                    return Err(StoreError::PatchError(format!(
+                        "Index out of bounds: {}",
+                        last_segment
+                    )));
+                }
+                Ok(vec.remove(idx))
+            }
+            SharedValue::Leaf(_) => Err(StoreError::PatchError(format!(
+                "Cannot remove from leaf at {}",
+                parent_path
+            ))),
+        }
+    }
+}
+
+fn parse_segments(path: &str) -> impl Iterator<Item = String> + '_ {
+    path.split('/')
+        .skip(1)
+        .map(|s| s.replace("~1", "/").replace("~0", "~"))
+}
+
+fn split_path(path: &str) -> (&str, &str) {
+    if let Some(pos) = path.rfind('/') {
+        (&path[..pos], &path[pos + 1..])
+    } else {
+        ("", path)
+    }
+}
+
+fn parse_index(segment: &str, len: usize, allow_end: bool) -> Result<usize, StoreError> {
+    if segment == "-" {
+        if allow_end {
+            return Ok(len);
+        } else {
+            return Err(StoreError::PatchError("'-' index not allowed here".into()));
+        }
+    }
+
+    // RFC 6901: array index must be a number with no leading zeros (unless it's just '0')
+    if segment.len() > 1 && segment.starts_with('0') {
+        return Err(StoreError::PatchError(format!(
+            "Invalid array index (leading zero): {}",
+            segment
+        )));
+    }
+
+    let idx: usize = segment
+        .parse()
+        .map_err(|_| StoreError::PatchError(format!("Invalid array index: {}", segment)))?;
+
+    Ok(idx)
 }
 
 /// The Store
@@ -124,7 +371,7 @@ impl Store {
     }
 
     /// Apply a patch. Performs COW update, periodic rebase, and automatic GC.
-    pub fn update(&mut self, patch: Value) {
+    pub fn update(&mut self, patch: Value) -> Result<(), StoreError> {
         // Use a block to ensure latest_arc is dropped BEFORE gc
         let (latest_gen, mut new_val) = {
             let (latest_gen, latest_arc) = self.latest_with_gen();
@@ -132,8 +379,16 @@ impl Store {
             (latest_gen, (*latest_arc).clone())
         };
 
-        // Apply patch (efficient structural update)
-        new_val.apply_merge_patch(patch);
+        // Auto-detect patch type
+        if patch.is_object() {
+            new_val.apply_merge_patch(patch);
+        } else if patch.is_array() {
+            let p: Patch =
+                serde_json::from_value(patch).map_err(|e| StoreError::PatchError(e.to_string()))?;
+            new_val.apply_json_patch(p)?;
+        } else {
+            return Err(StoreError::InvalidPatchFormat);
+        }
 
         let next_gen = latest_gen + 1;
         let final_value = if next_gen.is_multiple_of(self.interval) {
@@ -144,6 +399,7 @@ impl Store {
 
         self.commit(next_gen, final_value);
         self.gc();
+        Ok(())
     }
 
     /// Retrieve a specific generation. Returns Arc for O(1) handover.
@@ -278,7 +534,7 @@ impl SharedStore {
 
     /// Apply a patch. Performs COW update and periodic rebase outside the write lock.
     /// Serialization is handled by a Mutex, but the RwLock is only held for a brief moment to commit.
-    pub fn update(&self, patch: Value) {
+    pub fn update(&self, patch: Value) -> Result<(), StoreError> {
         // Serialize writers to ensure we don't have multiple threads trying to calculate Gen N
         let _guard = self.inner.update_lock.lock();
 
@@ -295,7 +551,16 @@ impl SharedStore {
         };
 
         // Do most of our modification work without locking the store
-        new_val.apply_merge_patch(patch);
+        // Auto-detect patch type
+        if patch.is_object() {
+            new_val.apply_merge_patch(patch);
+        } else if patch.is_array() {
+            let p: Patch =
+                serde_json::from_value(patch).map_err(|e| StoreError::PatchError(e.to_string()))?;
+            new_val.apply_json_patch(p)?;
+        } else {
+            return Err(StoreError::InvalidPatchFormat);
+        }
 
         let next_gen = latest_gen + 1;
         let final_value = if next_gen.is_multiple_of(interval) {
@@ -310,6 +575,7 @@ impl SharedStore {
             store.commit(next_gen, final_value);
             store.gc();
         }
+        Ok(())
     }
 
     /// Retrieve a specific generation. Returns Arc for O(1) handover.

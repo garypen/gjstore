@@ -31,10 +31,12 @@ fn main() {
             for i in 1..=5 {
                 thread::sleep(Duration::from_millis(100));
                 println!("Writer: Updating to generation {}", i);
-                s_writer.update(json!({
-                    "metadata": { "version": i + 1 },
-                    "counters": { "a": i * 10 }
-                }));
+                s_writer
+                    .update(json!({
+                        "metadata": { "version": i + 1 },
+                        "counters": { "a": i * 10 }
+                    }))
+                    .unwrap();
             }
         });
 

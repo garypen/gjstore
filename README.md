@@ -2,16 +2,19 @@
 
 A Generational JSON Store for Rust.
 
-`gjstore` is a library that provides a thread-safe, versioned JSON store with structural sharing. It allows you to maintain multiple generations of a JSON document, applying updates via RFC 7396 Merge Patching while keeping memory usage efficient.
+`gjstore` is a library that provides a thread-safe, versioned JSON store with structural sharing. It allows you to maintain multiple generations of a JSON document, applying updates via standard JSON patch formats while keeping memory usage efficient.
 
 ## Features
 
-- Generational Updates: Every update creates a new version (generation) of the store.
-- Structural Sharing: Uses `Arc` and Copy-on-Write (COW) patterns to share data between generations.
-- RFC 7396 Merge Patch: Supports standard JSON merge patching for updates.
-- Automatic Garbage Collection: Automatically removes older generations that are no longer referenced.
-- Thread Safety: Provides `SharedStore` for concurrent access with optimized locking.
-- Periodic Rebasing: Performs periodic deep copies to ensure memory locality and prevent long-lived objects from pinning memory.
+- **Generational Updates**: Every update creates a new version (generation) of the store.
+- **Structural Sharing**: Uses `Arc` and Copy-on-Write (COW) patterns to share data between generations.
+- **Dual Patch Support**: Automatically detects and applies updates in two standard formats:
+  - **RFC 7396 (JSON Merge Patch)**: Best for simple object property updates.
+  - **RFC 6902 (JSON Patch)**: Best for precise array manipulation and atomic operations.
+- **Efficient Subtree Ops**: `move` and `copy` operations in JSON Patch are $O(1)$ due to structural sharing.
+- **Automatic Garbage Collection**: Automatically removes older generations that are no longer referenced.
+- **Thread Safety**: Provides `SharedStore` for concurrent access with optimized locking.
+- **Periodic Rebasing**: Performs periodic deep copies to ensure memory locality and prevent long-lived objects from pinning memory.
 
 ## Usage
 
@@ -23,7 +26,7 @@ The `Store` type is suitable for single-threaded usage.
 use gjstore::gjstore::Store;
 use serde_json::json;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial = json!({
         "project": "gjstore",
         "features": ["generational", "sharing"]
@@ -31,25 +34,22 @@ fn main() {
 
     let mut store = Store::builder()
         .value(initial)
-        .interval(20) // optional, defaults to 20
+        .interval(20)
         .build();
 
-    // Keep a reference to the oldest generation so that it is preserved
-    // past the update. If we didn't take the reference here, then the
-    // gc triggered by an update would remove that generation.
-    let oldest = store.oldest().unwrap();
-
-    // Apply a merge patch
+    // 1. Apply a Merge Patch (RFC 7396) - passing an Object
     store.update(json!({
-        "features": ["generational", "sharing", "patching"],
         "version": "0.1.0"
-    }));
+    }))?;
 
-    // Access generations
+    // 2. Apply a JSON Patch (RFC 6902) - passing an Array
+    store.update(json!([
+        {"op": "add", "path": "/features/-", "value": "patching"}
+    ]))?;
+
     let latest = store.latest().unwrap();
     println!("Latest: {:?}", latest);
-
-    println!("Oldest: {:?}", oldest);
+    Ok(())
 }
 ```
 
@@ -72,7 +72,8 @@ fn main() {
     for i in 0..10 {
         let s = Arc::clone(&store);
         handles.push(thread::spawn(move || {
-            s.update(json!({"count": i}));
+            // update returns a Result, though we unwrap here for simplicity
+            s.update(json!({"count": i})).unwrap();
         }));
     }
 
@@ -86,11 +87,14 @@ fn main() {
 
 ## How it works
 
-1. SharedValue: JSON values are converted into a `SharedValue` tree where objects and arrays are wrapped in `Arc`.
-2. Merge Patch: When a patch is applied, only the modified branches of the tree are cloned. Untouched branches are shared between the new and old generations.
-3. Garbage Collection: The store keeps a history of generations. When the oldest generation's `Arc` count drops to 1 (meaning it is only referenced by the store's history), it is eligible for removal.
-4. Rebase: Every `interval` generations (defaulting to 20), the store performs a deep clone of the latest value to consolidate memory and break references to old structural fragments.
+1. **SharedValue**: JSON values are converted into a `SharedValue` tree where objects and arrays are wrapped in `Arc`.
+2. **Structural Sharing**: When a patch is applied, only the modified branches of the tree are cloned (`Arc::make_mut`). Untouched branches are shared between generations.
+3. **Patch Detection**: 
+   - If the input is a JSON **Object**, it is treated as a Merge Patch.
+   - If the input is a JSON **Array**, it is treated as a JSON Patch.
+4. **Garbage Collection**: The store keeps a history of generations. When the oldest generation's `Arc` count drops to 1, it is automatically removed.
+5. **Rebase**: Every `interval` generations (default 20), the store performs a deep clone of the latest value to break references to old structural fragments and ensure memory locality.
 
 ## License
 
-This project is licensed under the MIT License or Apache 2.0 (check Cargo.toml for details if specified).
+This project is licensed under the MIT License or Apache 2.0.

@@ -270,7 +270,7 @@ fn report_memory(corpus: &Value, patch_pool: &[Value], history_limit: usize, ite
             _garbage = store.get(i - history_limit);
         }
         let patch = patch_pool[i % patch_pool.len()].clone();
-        store.update(patch.clone());
+        store.update(patch.clone()).unwrap();
         naive.update(patch);
         if i == history_limit {
             println!("At History Limit:");
@@ -314,7 +314,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             let mut idx = 0;
             b.iter(|| {
                 // 1 Write
-                store.update(patch_pool[idx % 1_000].clone());
+                store.update(patch_pool[idx % 1_000].clone()).unwrap();
                 idx += 1;
 
                 // N Reads
@@ -372,7 +372,7 @@ pub fn concurrent_benchmark(c: &mut Criterion) {
                     // Writer thread doing 10 writes
                     s.spawn(|| {
                         for i in 0..10 {
-                            store.update(patch_pool[i % 1_000].clone());
+                            store.update(patch_pool[i % 1_000].clone()).unwrap();
                         }
                     });
 
