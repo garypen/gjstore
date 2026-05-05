@@ -6,6 +6,7 @@ use bon::bon;
 use json_patch::Patch;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -20,7 +21,8 @@ pub enum StoreError {
 /// A structural-sharing JSON value.
 /// Containers (Objects/Arrays) are wrapped in Arc to allow different generations
 /// to share the same memory for untouched branches.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum SharedValue {
     Object(Arc<BTreeMap<String, SharedValue>>),
     Array(Arc<Vec<SharedValue>>),
