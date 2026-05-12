@@ -24,6 +24,19 @@ fn test_initialization() {
 }
 
 #[test]
+fn test_initial_label() {
+    let initial = json!({"a": 1});
+    let store = SharedStore::builder()
+        .value(initial)
+        .label("initial".to_string())
+        .build();
+
+    let gen0 = store.get_by_label("initial").expect("Label 'initial' should exist");
+    assert_eq!(shared_to_json(&gen0), json!({"a": 1}));
+    assert_eq!(store.get_generation_by_label("initial"), Some(0));
+}
+
+#[test]
 fn test_rfc7396_basic_update() {
     let store = SharedStore::builder()
         .value(json!({"a": 1, "b": 2}))

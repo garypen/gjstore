@@ -358,20 +358,29 @@ pub struct Store {
 
 #[bon]
 impl Store {
-    /// Create a store with optional initial JSON Value and rebase interval.
+    /// Create a store with initial JSON Value, rebase interval, and optional label.
     #[builder]
     pub fn new(
         #[builder(default = Value::Object(Default::default()))] value: Value,
         #[builder(default = 20)] interval: usize,
+        label: Option<String>,
     ) -> Self {
         let initial_shared = Arc::new(value.into());
+        let mut labels = BTreeMap::new();
+        let mut gen_to_label = BTreeMap::new();
+
+        if let Some(l) = label {
+            labels.insert(l.clone(), (0, Arc::downgrade(&initial_shared)));
+            gen_to_label.insert(0, l);
+        }
+
         let mut history = VecDeque::new();
         history.push_back((0, initial_shared));
 
         Self {
             history,
-            labels: BTreeMap::new(),
-            gen_to_label: BTreeMap::new(),
+            labels,
+            gen_to_label,
             next_gen: 1,
             interval,
         }
@@ -564,15 +573,22 @@ struct SharedStoreInner {
 
 #[bon]
 impl SharedStore {
-    /// Create a store with optional initial JSON Value and rebase interval.
+    /// Create a store with initial JSON Value, rebase interval, and optional label.
     #[builder]
     pub fn new(
         #[builder(default = Value::Object(Default::default()))] value: Value,
         #[builder(default = 20)] interval: usize,
+        label: Option<String>,
     ) -> Self {
         Self {
             inner: Arc::new(SharedStoreInner {
-                store: RwLock::new(Store::builder().value(value).interval(interval).build()),
+                store: RwLock::new(
+                    Store::builder()
+                        .value(value)
+                        .interval(interval)
+                        .maybe_label(label)
+                        .build(),
+                ),
                 update_lock: Mutex::new(()),
             }),
         }
