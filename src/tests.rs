@@ -400,3 +400,60 @@ fn test_intermingled_rfc7396_rfc6902_patches() {
         json!({"b": 2, "c": 3, "d": 4})
     );
 }
+
+#[test]
+fn test_labels_basic() {
+    let store = SharedStore::builder().value(json!({"count": 0})).build();
+
+    // Update with label
+    store
+        .update_with_label(json!({"count": 1}), "v1".to_string())
+        .unwrap();
+
+    let v1 = store.get_by_label("v1").expect("Label v1 should exist");
+    assert_eq!(shared_to_json(&v1), json!({"count": 1}));
+    assert_eq!(store.get_generation_by_label("v1"), Some(1));
+
+    // Update without label
+    store.update(json!({"count": 2})).unwrap();
+    assert!(store.get_by_label("v1").is_some());
+    assert_eq!(shared_to_json(&store.get_by_label("v1").unwrap()), json!({"count": 1}));
+}
+
+#[test]
+fn test_label_reassociation() {
+    let store = SharedStore::builder().value(json!({"count": 0})).build();
+
+    store.update_with_label(json!({"count": 1}), "tag".to_string()).unwrap();
+    assert_eq!(store.get_generation_by_label("tag"), Some(1));
+
+    store.update_with_label(json!({"count": 2}), "tag".to_string()).unwrap();
+    assert_eq!(store.get_generation_by_label("tag"), Some(2));
+}
+
+#[test]
+fn test_labels_and_gc() {
+    let store = SharedStore::builder().value(json!({"count": 0})).build();
+
+    // Gen 1 with label
+    store.update_with_label(json!({"count": 1}), "keep_me".to_string()).unwrap();
+
+    // Gen 2
+    store.update(json!({"count": 2})).unwrap();
+
+    // GC check:
+    // history: [gen0, gen1, gen2]
+    // gen0 count 1 -> popped
+    // gen1 count 1 (weak label) -> popped
+    // history: [gen2]
+
+    assert!(store.get(1).is_none(), "Generation 1 should be GC'd even with a label");
+    assert!(store.get_by_label("keep_me").is_none(), "Label should be removed when generation is GC'd");
+
+    // Now try with pinning
+    store.update_with_label(json!({"count": 3}), "pinned".to_string()).unwrap();
+    let _pin = store.get_by_label("pinned").unwrap();
+
+    store.update(json!({"count": 4})).unwrap();
+    assert!(store.get_by_label("pinned").is_some(), "Pinned generation should NOT be GC'd");
+}

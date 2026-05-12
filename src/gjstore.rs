@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Weak;
 
 use bon::bon;
 use json_patch::Patch;
@@ -349,6 +350,8 @@ fn parse_index(segment: &str, len: usize, allow_end: bool) -> Result<usize, Stor
 #[derive(Clone, Debug)]
 pub struct Store {
     history: VecDeque<(usize, Arc<SharedValue>)>,
+    labels: BTreeMap<String, (usize, Weak<SharedValue>)>,
+    gen_to_label: BTreeMap<usize, String>,
     next_gen: usize,
     interval: usize,
 }
@@ -367,6 +370,8 @@ impl Store {
 
         Self {
             history,
+            labels: BTreeMap::new(),
+            gen_to_label: BTreeMap::new(),
             next_gen: 1,
             interval,
         }
@@ -374,6 +379,16 @@ impl Store {
 
     /// Apply a patch. Performs COW update, periodic rebase, and automatic GC.
     pub fn update(&mut self, patch: Value) -> Result<(), StoreError> {
+        self.internal_update(patch, None)
+    }
+
+    /// Apply a patch and associate a label with the new generation.
+    /// Performs COW update, periodic rebase, and automatic GC.
+    pub fn update_with_label(&mut self, patch: Value, label: String) -> Result<(), StoreError> {
+        self.internal_update(patch, Some(label))
+    }
+
+    fn internal_update(&mut self, patch: Value, label: Option<String>) -> Result<(), StoreError> {
         // Use a block to ensure latest_arc is dropped BEFORE gc
         let (latest_gen, mut new_val) = {
             let (latest_gen, latest_arc) = self.latest_with_gen();
@@ -399,7 +414,7 @@ impl Store {
             Arc::new(new_val)
         };
 
-        self.commit(next_gen, final_value);
+        self.commit(next_gen, final_value, label);
         self.gc();
         Ok(())
     }
@@ -410,6 +425,22 @@ impl Store {
             .iter()
             .find(|(id, _)| *id == generation)
             .map(|(_, v)| Arc::clone(v))
+    }
+
+    /// Retrieve a generation by label. Returns Arc for O(1) handover.
+    pub fn get_by_label(&self, label: &str) -> Option<Arc<SharedValue>> {
+        self.labels.get(label).and_then(|(_, w)| w.upgrade())
+    }
+
+    /// Retrieve the generation number associated with a label.
+    pub fn get_generation_by_label(&self, label: &str) -> Option<usize> {
+        self.labels.get(label).and_then(|(gen_num, w)| {
+            if w.strong_count() > 0 {
+                Some(*gen_num)
+            } else {
+                None
+            }
+        })
     }
 
     /// Retrieve latest generation. Returns Arc for O(1) handover.
@@ -429,7 +460,15 @@ impl Store {
     }
 
     /// Internal helper for SharedStore staged updates.
-    fn commit(&mut self, generation: usize, value: Arc<SharedValue>) {
+    fn commit(&mut self, generation: usize, value: Arc<SharedValue>, label: Option<String>) {
+        if let Some(l) = label {
+            // Remove old label association if it exists
+            if let Some((old_gen, _)) = self.labels.remove(&l) {
+                self.gen_to_label.remove(&old_gen);
+            }
+            self.labels.insert(l.clone(), (generation, Arc::downgrade(&value)));
+            self.gen_to_label.insert(generation, l);
+        }
         self.history.push_back((generation, value));
         self.next_gen = generation + 1;
     }
@@ -438,7 +477,10 @@ impl Store {
     fn gc(&mut self) {
         while self.history.len() > 1 {
             if Arc::strong_count(&self.history[0].1) == 1 {
-                self.history.pop_front();
+                let (gen_num, _) = self.history.pop_front().unwrap();
+                if let Some(label) = self.gen_to_label.remove(&gen_num) {
+                    self.labels.remove(&label);
+                }
             } else {
                 break;
             }
@@ -539,6 +581,17 @@ impl SharedStore {
     /// Apply a patch. Performs COW update and periodic rebase outside the write lock.
     /// Serialization is handled by a Mutex, but the RwLock is only held for a brief moment to commit.
     pub fn update(&self, patch: Value) -> Result<(), StoreError> {
+        self.internal_update(patch, None)
+    }
+
+    /// Apply a patch and associate a label with the new generation.
+    /// Performs COW update and periodic rebase outside the write lock.
+    /// Serialization is handled by a Mutex, but the RwLock is only held for a brief moment to commit.
+    pub fn update_with_label(&self, patch: Value, label: String) -> Result<(), StoreError> {
+        self.internal_update(patch, Some(label))
+    }
+
+    fn internal_update(&self, patch: Value, label: Option<String>) -> Result<(), StoreError> {
         // Serialize writers to ensure we don't have multiple threads trying to calculate Gen N
         let _guard = self.inner.update_lock.lock();
 
@@ -576,7 +629,7 @@ impl SharedStore {
         // Finally, commit the result under a WRITE lock
         {
             let mut store = self.inner.store.write();
-            store.commit(next_gen, final_value);
+            store.commit(next_gen, final_value, label);
             store.gc();
         }
         Ok(())
@@ -586,6 +639,18 @@ impl SharedStore {
     pub fn get(&self, generation: usize) -> Option<Arc<SharedValue>> {
         let store = self.inner.store.read();
         store.get(generation)
+    }
+
+    /// Retrieve a generation by label. Returns Arc for O(1) handover.
+    pub fn get_by_label(&self, label: &str) -> Option<Arc<SharedValue>> {
+        let store = self.inner.store.read();
+        store.get_by_label(label)
+    }
+
+    /// Retrieve the generation number associated with a label.
+    pub fn get_generation_by_label(&self, label: &str) -> Option<usize> {
+        let store = self.inner.store.read();
+        store.get_generation_by_label(label)
     }
 
     /// Retrieve latest generation. Returns Arc for O(1) handover.
