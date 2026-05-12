@@ -507,10 +507,12 @@ impl Store {
 }
 
 /// The Thread-Safe Store
+#[derive(Clone, Debug)]
 pub struct SharedStore {
     inner: Arc<SharedStoreInner>,
 }
 
+#[derive(Debug)]
 struct SharedStoreInner {
     store: RwLock<Store>,
     /// Serializes updates to ensure only one thread is calculating the next generation
